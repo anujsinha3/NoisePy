@@ -94,14 +94,20 @@ def cross_correlate(
         return [timespans]
 
     [timespans] = scheduler.initialize(init, 1)
-    errors = False
+    failed = []
     for its in scheduler.get_indices(timespans):
         ts = timespans[its]
-        errors = errors or cc_timespan(raw_store, fft_params, cc_store, ts, pair_filter)
+        failed_pairs = cc_timespan(raw_store, fft_params, cc_store, ts, pair_filter)
+        if len(failed_pairs) > 0:
+            failed.extend((ts, failed_pairs))
 
     tlog.log(f"Step 1 in total with {os.cpu_count()} cores", t_s1_total)
-    if errors:
-        raise RuntimeError("Errors occurred during cross-correlation. Check logs for details")
+    if len(failed):
+        failed_str = "\n".join(map(str, failed))
+        logger.error(
+            "Errors occurred during cross-correlation. Check logs for details. "
+            f"The following pairs failed:\n{failed_str}"
+        )
 
 
 def cc_timespan(
@@ -110,9 +116,8 @@ def cc_timespan(
     cc_store: CrossCorrelationDataStore,
     ts: DateTimeRange,
     pair_filter: Callable[[Channel, Channel], bool] = lambda src, rec: True,
-) -> bool:
-    errors = False
-    executor = ThreadPoolExecutor(max_workers=12)
+) -> List[Tuple[Station, Station]]:
+    executor = ThreadPoolExecutor()
     tlog = TimeLogger(logger, logging.INFO, prefix="CC Main")
     """
     LOADING NOISE DATA AND DO FFT
@@ -134,7 +139,11 @@ def cc_timespan(
     station_pairs = list(create_pairs(pair_filter, all_channels, fft_params.acorr_only).keys())
     # Check for stations that are already done, do this in parallel
     logger.info(f"Checking for stations already done: {len(station_pairs)} pairs")
-    station_pair_dones = list(map(lambda p: cc_store.contains(ts, p[0], p[1]), station_pairs))
+
+    stations = set([station for pair in station_pairs for station in pair])
+    _ = list(executor.map(lambda s: cc_store.contains(s, s, ts), stations))
+    tlog.log(f"check for {len(stations)} stations already done (warm up cache)")
+    station_pair_dones = list(executor.map(lambda p: cc_store.contains(p[0], p[1], ts), station_pairs))
 
     missing_pairs = [pair for pair, done in zip(station_pairs, station_pair_dones) if not done]
     # get a set of unique stations from the list of pairs
@@ -151,7 +160,7 @@ def cc_timespan(
     )
     if len(missing_channels) == 0:
         logger.warning(f"{ts} already completed")
-        return False
+        return []
 
     ch_data_tuples = _read_channels(
         executor, ts, raw_store, missing_channels, fft_params.samp_freq, fft_params.single_freq
@@ -160,18 +169,17 @@ def cc_timespan(
 
     if len(ch_data_tuples) == 0:
         logger.warning(f"No data available for {ts}")
-        return False
+        return missing_pairs
 
-    channels = list(zip(*ch_data_tuples))[0]
-    tlog.log(f"Read channel data: {len(channels)} channels")
-
-    ch_data_tuples = preprocess_all(executor, ch_data_tuples, raw_store, fft_params, ts)
-    tlog.log(f"Preprocess: {len(ch_data_tuples)} channels")
-    if len(ch_data_tuples) == 0:
+    tlog.log(f"Read channel data: {len(ch_data_tuples)} channels")
+    ch_data_tuples_pre = preprocess_all(executor, ch_data_tuples, raw_store, fft_params, ts)
+    del ch_data_tuples
+    tlog.log(f"Preprocess: {len(ch_data_tuples_pre)} channels")
+    if len(ch_data_tuples_pre) == 0:
         logger.warning(f"No data available for {ts} after preprocessing")
-        return False
+        return missing_pairs
 
-    nchannels = len(ch_data_tuples)
+    nchannels = len(ch_data_tuples_pre)
     nseg_chunk = check_memory(fft_params, nchannels)
     # Dictionary to store all the FFTs, keyed by channel index
     ffts: Dict[int, NoiseFFT] = OrderedDict()
@@ -180,12 +188,15 @@ def cc_timespan(
     # loop through all channels
     tlog.reset()
 
-    fft_refs = [executor.submit(compute_fft, fft_params, chd[1]) for chd in ch_data_tuples]
-    fft_datas = get_results(fft_refs, "Compute ffts")
+    fft_refs = [executor.submit(compute_fft, fft_params, chd[1]) for chd in ch_data_tuples_pre]
+    # Important: get the list of channels at this point and not before because some
+    # tuples could have been removed during pre-processing
+    channels = list(zip(*ch_data_tuples_pre))[0]
     # Done with the raw data, clear it out
-    ch_data_tuples.clear()
-    del ch_data_tuples
+    ch_data_tuples_pre.clear()
+    del ch_data_tuples_pre
     gc.collect()
+    fft_datas = get_results(fft_refs, "Compute ffts")
     for ix_ch, fft_data in enumerate(fft_datas):
         if fft_data.fft.size > 0:
             ffts[ix_ch] = fft_data
@@ -195,7 +206,7 @@ def cc_timespan(
     Nfft = max(map(lambda d: d.length, fft_datas))
     if Nfft == 0:
         logger.error(f"No FFT data available for any channel in {ts}, skipping")
-        return True
+        return missing_pairs
 
     if len(ffts) != nchannels:
         logger.warning("it seems some stations miss data in download step, but it is OKAY!")
@@ -225,11 +236,15 @@ def cc_timespan(
         )
         tasks.append(t)
     compute_results = get_results(tasks, "Cross correlation")
-    successes, save_tasks = zip(*compute_results)
-    errors = errors or not all(successes)
+    _, save_tasks = zip(*compute_results)
     save_tasks = [t for t in save_tasks if t]
-    save_results = get_results(save_tasks, "Save correlations")
-    errors = errors or not all(save_results)
+    _ = get_results(save_tasks, "Save correlations")
+    failed_pairs = [
+        pair[0]
+        for pair, (comp_res, save_task) in zip(work_items, compute_results)
+        if not (comp_res and (save_task is None or save_task.result()))
+    ]
+
     save_exec.shutdown()
     tlog.log("Correlate and write to store")
 
@@ -238,7 +253,7 @@ def cc_timespan(
 
     tlog.log(f"Process the chunk of {ts}", t_chunk)
     executor.shutdown()
-    return errors
+    return failed_pairs
 
 
 def create_pairs(
@@ -259,10 +274,10 @@ def create_pairs(
                 if src_chan.station != rec_chan.station:
                     continue
             if ffts and iiS not in ffts:
-                logger.warning(f"No FFT data available for channel '{src_chan}', skipped")
+                logger.warning(f"No FFT data available for src channel '{src_chan}', skipped")
                 continue
             if ffts and iiR not in ffts:
-                logger.warning(f"No FFT data available for channel '{rec_chan}', skipped")
+                logger.warning(f"No FFT data available for rec channel '{rec_chan}', skipped")
                 continue
 
             station_pairs[(src_chan.station, rec_chan.station)].append((iiS, iiR))
@@ -284,13 +299,15 @@ def stations_cross_correlation(
     tlog = TimeLogger(logger, logging.DEBUG)
     datas = []
     try:
-        if cc_store.contains(ts, src, rec):
+        if cc_store.contains(src, rec, ts):
             logger.info(f"Skipping {src}_{rec} for {ts} since it's already done")
             return True, None
 
         # TODO: Are there any potential gains to parallelliing this? It could make a difference if
         # num station pairs < num cores since we are already parallelizing at the station pair level
         for src_chan, rec_chan in channel_pairs:
+            assert channels[src_chan].station == src
+            assert channels[rec_chan].station == rec
             result = cross_correlation(fft_params, src_chan, rec_chan, channels, ffts, Nfft)
             if result is not None:
                 data = CrossCorrelation(result[0].type, result[1].type, result[2], result[3])
@@ -351,18 +368,16 @@ def preprocess_all(
     fft_params: ConfigParameters,
     ts: DateTimeRange,
 ) -> List[Tuple[Channel, ChannelData]]:
+    channels = list(zip(*ch_data))[0]
     stream_refs = [executor.submit(preprocess, raw_store, t[0], t[1], fft_params, ts) for t in ch_data]
+    del ch_data
     new_streams = get_results(stream_refs, "Pre-process")
     # Log if any streams were removed during pre-processing
-    for ch, st in zip(ch_data, new_streams):
+    for ch, st in zip(channels, new_streams):
         if len(st) == 0:
-            logging.warning(
-                f"Empty stream for {ts}/{ch[0]} after pre-processing. "
-                f"Before pre-processing data.shape: {ch[1].data.shape}, len(stream): {len(ch[1].stream)}"
-            )
+            logging.warning(f"Empty stream for {ts}/{ch} after pre-processing. ")
 
     # Filter to only non-empty streams
-    channels = list(zip(*ch_data))[0]
     non_empty = filter(lambda tup: len(tup[1]) > 0, zip(channels, new_streams))
     return [(ch, ChannelData(st)) for ch, st in non_empty]
 

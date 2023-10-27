@@ -33,12 +33,12 @@ When making changes, please run the following two tests:
 
 Unit tests:
 ```
-pytest ./tests
+pytest ./tests ./integration_tests
 ```
 
 CLI Integration tests:
 ```
-tests/test_cli.sh zarr
+tests/test_cli.sh numpy
 tests/test_cli.sh asdf
 ```
 
@@ -58,7 +58,7 @@ The data processing in NoisePy consists of three steps:
 used to download data from an FDSN web service. Alternatively, data from an [S3 bucket](https://s3.console.aws.amazon.com/s3/buckets/scedc-pds) can be copied
 locally using the `aws` CLI, or streamed directly from S3.
 2. **Step 1 - Cross Correlation**: Computes cross correlaton for pairs of stations/channels. This can done with either the `cross_correlate()` function or the `noisepy cross_correlate` CLI command.
-3. **Step 2 - Stacking**: This steps takes the cross correlation computations across multiple timespans and stacks them for a given station/channel pair. This can done with either the `stack()` function or the `noisepy stack` CLI command.
+3. **Step 2 - Stacking**: This steps takes the cross correlation computations across multiple timespans and stacks them for a given station/channel pair. This can done with either the `stack_cross_correlations()` function or the `noisepy stack` CLI command.
 
 ### Data Formats
 
