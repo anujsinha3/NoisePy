@@ -123,6 +123,26 @@ class FreqNorm(Enum):
     PHASE_ONLY = "phase_only"
 
 
+class CCMethod(str, Enum):
+    XCORR = "xcorr"
+    DECONV = "deconv"
+    COHERENCY = "coherency"
+
+
+class TimeNorm(str, Enum):
+    NO = "no"
+    ONE_BIT = "one_bit"
+    RMA = "rma"
+
+
+class RmResp(str, Enum):
+    NO = "no"
+    INV = "inv"
+    SPECTRUM = "spectrum"
+    POLES_ZEROS = "poleszeros"
+    RESP = "RESP"
+
+
 class ConfigParameters(BaseModel):
     model_config = ConfigDict(validate_default=True)
 
@@ -156,12 +176,13 @@ class ConfigParameters(BaseModel):
     )
     # TODO: change "no"for "None", and add "one_bit"as an option
     # TODO: change time_norm option from "no"to "None"
-    time_norm: str = Field(
-        default="no", description="'no' for no normalization, or 'rma', 'one_bit' for normalization in time domain,"
+    time_norm: TimeNorm = Field(
+        default=TimeNorm.NO.value,
+        description="'no' for no normalization, or 'rma', 'one_bit' for normalization in time domain,",
     )
     # FOR "COHERENCY"PLEASE set freq_norm to "rma", time_norm to "no"and cc_method to "xcorr"
-    cc_method: str = Field(
-        default="xcorr", description="'xcorr' for pure cross correlation, 'deconv' for deconvolution;"
+    cc_method: CCMethod = Field(
+        default=CCMethod.XCORR.value, description="'xcorr' for pure cross correlation, 'deconv' for deconvolution;"
     )
     smooth_N: int = Field(
         default=10, description="moving window length for time/freq domain normalization if selected (points)"
@@ -187,7 +208,9 @@ class ConfigParameters(BaseModel):
     stationxml: bool = Field(
         default=False, description="station.XML file used to remove instrument response for SAC/miniseed data"
     )
-    rm_resp: str = Field(default="inv", description="select 'no' to not remove response and use 'inv','spectrum',")
+    rm_resp: RmResp = Field(
+        default=RmResp.INV.value, description="select 'no' to not remove response and use 'inv','spectrum',"
+    )
     rm_resp_out: str = Field(default="VEL", description="output location from response removal")
     respdir: Optional[str] = Field(default=None, description="response directory")
     # some control parameters
@@ -207,6 +230,8 @@ class ConfigParameters(BaseModel):
         description="Storage options to pass to fsspec, keyed by protocol (local files are ''))",
     )
 
+    stations_file: Optional[str] = Field(default=None)
+
     def get_storage_options(self, path: str) -> Dict[str, Any]:
         """The storage options for the given path"""
         url = urlparse(path)
@@ -215,6 +240,29 @@ class ConfigParameters(BaseModel):
     @property
     def dt(self) -> float:
         return 1.0 / self.samp_freq
+
+    def load_stations(self, stations_list=None) -> Optional[List[str]]:
+        if stations_list is None and self.stations_file:
+            # Use get_filesystem to get the filesystem associated with the filename
+            fs = get_filesystem(self.stations_file, storage_options=self.storage_options)
+
+            # Load the list from the file
+            with fs.open(self.stations_file, "r") as file:
+                self.stations = file.read().splitlines()
+        else:
+            self.stations = stations_list
+
+        return self.stations if self.stations else None
+
+    def save_stations(self, value: List[str]):
+        if self.stations_file:
+            fs = get_filesystem(self.stations_file, storage_options=self.storage_options)
+            # Save the list to the file
+            with fs.open(self.stations_file, "w") as file:
+                file.write("\n".join(value) + "\n")
+            # Set stations field to Empty List
+            # self.stations = []
+        return None
 
     @model_validator(mode="after")
     def validate(cls, m: ConfigParameters) -> ConfigParameters:
@@ -228,6 +276,14 @@ class ConfigParameters(BaseModel):
         validate_date(m.end_date, "end_date")
         if m.substack_len % m.cc_len != 0:
             raise ValueError(f"substack_len ({m.substack_len}) must be a multiple of cc_len ({m.cc_len})")
+
+        if m.stations_file:
+            fs = get_filesystem(m.stations_file, storage_options=m.storage_options)
+
+            # Check if the file exists
+            if not fs.exists(m.stations_file):
+                raise ValueError(f"{m.stations_file} is not a valid file path in stations_file.")
+
         return m
 
     # TODO: Remove once all uses of ConfigParameters have been converted to use strongly typed access
@@ -410,4 +466,6 @@ def _to_json_type(value: Any) -> Any:
         or isinstance(value, np.int8)
     ):
         return int(value)
+    elif isinstance(value, np.bool_):
+        return bool(value)
     return value

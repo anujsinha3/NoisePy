@@ -25,7 +25,15 @@ from obspy.signal.util import _npts2nfft
 from scipy.fftpack import next_fast_len
 from scipy.signal import hilbert
 
-from .datatypes import ChannelData, ConfigParameters, FreqNorm, StackMethod
+from .datatypes import (
+    CCMethod,
+    ChannelData,
+    ConfigParameters,
+    FreqNorm,
+    RmResp,
+    StackMethod,
+    TimeNorm,
+)
 
 logger = logging.getLogger(__name__)
 """
@@ -235,12 +243,12 @@ def preprocess_raw(
     # remove traces of too small length
 
     # options to remove instrument response
-    if rm_resp != "no":
-        if rm_resp != "inv":
+    if rm_resp != RmResp.NO:
+        if rm_resp != RmResp.INV:
             if (respdir is None) or (not os.path.isdir(respdir)):
                 raise ValueError("response file folder not found! abort!")
 
-        if rm_resp == "inv":
+        if rm_resp == RmResp.INV:
             # ----check whether inventory is attached----
             if not inv[0][0][0].response:
                 raise ValueError("no response found in the inventory! abort!")
@@ -256,14 +264,14 @@ def preprocess_raw(
                     st = []
                     return st
 
-        elif rm_resp == "spectrum":
+        elif rm_resp == RmResp.SPECTRUM:
             logger.info("remove response using spectrum")
             specfile = glob.glob(os.path.join(respdir, "*" + station + "*"))
             if len(specfile) == 0:
                 raise ValueError("no response sepctrum found for %s" % station)
             st = resp_spectrum(st, specfile[0], samp_freq, pre_filt)
 
-        elif rm_resp == "RESP":
+        elif rm_resp == RmResp.RESP:
             logger.info("remove response using RESP files")
             resp = glob.glob(os.path.join(respdir, "RESP." + station + "*"))
             if len(resp) == 0:
@@ -275,7 +283,7 @@ def preprocess_raw(
             }
             st.simulate(paz_remove=None, pre_filt=pre_filt, seedresp=seedresp)
 
-        elif rm_resp == "poleszeros":
+        elif rm_resp == RmResp.POLES_ZEROS:
             logger.info("remove response using poles and zeros")
             paz_sts = glob.glob(os.path.join(respdir, "*" + station + "*"))
             if len(paz_sts) == 0:
@@ -547,10 +555,10 @@ def noise_processing(fft_para: ConfigParameters, dataS):
     source_white: 2D matrix of data spectra
     """
     # ------to normalize in time or not------
-    if fft_para.time_norm != "no":
-        if fft_para.time_norm == "one_bit":  # sign normalization
+    if fft_para.time_norm != TimeNorm.NO:
+        if fft_para.time_norm == TimeNorm.ONE_BIT:  # sign normalization
             white = np.sign(dataS)
-        elif fft_para.time_norm == "rma":  # running mean: normalization over smoothed absolute average
+        elif fft_para.time_norm == TimeNorm.RMA:  # running mean: normalization over smoothed absolute average
             white = np.zeros(shape=dataS.shape, dtype=dataS.dtype)
             for kkk in range(dataS.shape[0]):
                 white[kkk, :] = dataS[kkk, :] / moving_ave(np.abs(dataS[kkk, :]), fft_para.smooth_N)
@@ -583,7 +591,7 @@ def smooth_source_spect(cc_para, fft1):
     cc_method = cc_para["cc_method"]
     smoothspect_N = cc_para["smoothspect_N"]
 
-    if cc_method == "deconv":
+    if cc_method == CCMethod.DECONV:
         # -----normalize single-station cc to z component-----
         temp = moving_ave(np.abs(fft1), smoothspect_N)
         try:
@@ -591,14 +599,14 @@ def smooth_source_spect(cc_para, fft1):
         except Exception:
             raise ValueError("smoothed spectrum has zero values")
 
-    elif cc_method == "coherency":
+    elif cc_method == CCMethod.COHERENCY:
         temp = moving_ave(np.abs(fft1), smoothspect_N)
         try:
             sfft1 = np.conj(fft1) / temp
         except Exception:
             raise ValueError("smoothed spectrum has zero values")
 
-    elif cc_method == "xcorr":
+    elif cc_method == CCMethod.XCORR:
         sfft1 = np.conj(fft1)
 
     else:
@@ -937,7 +945,7 @@ def cc_parameters(cc_para, coor, tcorr, ncorr, comp):
         "lonR": np.float32(lonR),
         "latR": np.float32(latR),
         "ngood": ncorr,
-        "cc_method": cc_method,
+        "cc_method": str(cc_method.value),
         "time": tcorr,
         "substack": substack,
         "comp": comp,
@@ -1257,7 +1265,7 @@ def portion_gaps(stream, starttime: obspy.UTCDateTime, endtime: obspy.UTCDateTim
     return pgaps
 
 
-@jit("float32[:](float32[:],float32)")
+@jit("float32[:](float32[:],float32)", nopython=True)
 def segment_interpolate(sig1, nfric):
     """
     this function interpolates the data to ensure all points located on interger times of the

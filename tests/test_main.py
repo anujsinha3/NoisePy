@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from typing import List
 from unittest import mock
@@ -6,8 +7,10 @@ import obspy
 import pytest
 
 from noisepy.seis.constants import NO_CCF_DATA_MSG
+from noisepy.seis.datatypes import CCMethod
 from noisepy.seis.main import (
     Command,
+    ErrorStopHandler,
     _valid_config_file,
     initialize_params,
     main,
@@ -22,7 +25,7 @@ def test_parse_args():
     cmd += ["--step", "5"]
     cmd += ["--samp_freq", "160.4"]
     cmd += ["--stations", "BAK,ARV"]
-    cmd += ["--cc_method", "foobar"]
+    cmd += ["--cc_method", "xcorr"]
     cmd += ["--substack", "true"]
     cmd += ["--correction", "False"]
     args = parse_args(cmd)
@@ -33,7 +36,7 @@ def test_parse_args():
     assert cfg.step == 5
     assert cfg.samp_freq == 160.4
     assert cfg.stations == ["BAK", "ARV"]
-    assert cfg.cc_method == "foobar"
+    assert cfg.cc_method == CCMethod.XCORR
     assert cfg.substack is True
     assert cfg.correction is False
 
@@ -49,7 +52,7 @@ def run_cmd_with_empty_dirs(cmd: Command, args: List[str]):
 
 def test_main_cc(tmp_path):
     tmp = str(tmp_path)
-    run_cmd_with_empty_dirs(Command.CROSS_CORRELATE, [empty("raw_data", tmp), empty("xml", tmp)])
+    run_cmd_with_empty_dirs(Command.CROSS_CORRELATE, [empty("raw_data", tmp), empty("xml", tmp), "--stop_on_error"])
 
 
 def test_main_stack(tmp_path):
@@ -73,6 +76,15 @@ def test_main_download(tmp_path):
                 "--channels=''",
             ],
         )
+
+
+def test_error_handler():
+    handler = ErrorStopHandler()
+
+    # info shpuld not raise
+    handler.handle(logging.LogRecord("name", logging.INFO, "pathname", 0, "msg", None, None))
+    with pytest.raises(RuntimeError):
+        handler.handle(logging.LogRecord("name", logging.ERROR, "pathname", 0, "msg", None, RuntimeError("error")))
 
 
 def test_valid_config(tmp_path):
